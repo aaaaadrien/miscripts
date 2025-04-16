@@ -1,0 +1,36 @@
+# Merci à Esteban91420 sur Twitch pour son partage
+
+
+export CANAME='CA-IT'
+export CA="/etc/${CANAME}/"
+export CAKey="/etc/${CANAME}/private"
+export CACSR="/etc/${CANAME}/csr"
+export CACRT="/etc/${CANAME}/certs"
+export CACRL="/etc/${CANAME}/crl"
+export CERTNAME="monsite.domaine.fr"
+export CERTALTNAME="DNS:monsite.domaine.fr,DNS:monsite2.domaine.fr,IP:10.200.21.182"
+
+# Generation de la clé privé
+openssl genrsa -out ${CERTNAME}-temp.pem 2048
+openssl pkcs8 -inform PEM -outform PEM -in ${CERTNAME}-temp.pem -topk8 -nocrypt -v1 PBE-SHA1-3DES -out ${CERTNAME}.pem
+# Demande de certificat
+openssl req -new -sha256 -config ${CA}/validation.cnf -key ${CERTNAME}-temp.pem -subj "/C=FR/L=DIJON/O=SITE/OU=SERVICES/CN=${CERTNAME}" -out ${CERTNAME}.csr
+
+cat <<EOF >> ${CERTNAME}.ext
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth,clientAuth
+authorityInfoAccess = OCSP;URI:http://pki.domaine.local:8081/
+crlDistributionPoints = URI:http://pki.domaine.local/revoke.crl
+EOF
+echo "subjectAltName=${CERTALTNAME}" >> ${CERTNAME}.ext
+
+openssl ca -days 3650 -notext -md sha256 -config ${CA}/validation.cnf -extfile ${CERTNAME}.ext -extensions v3_req -policy policy_anything -out ${CERTNAME}.pem -infiles ${CERTNAME}.csr
+
+rm ${CERTNAME}-temp.pem
+mv ${CERTNAME}.csr $CACRT/ -v
+rm ${CERTNAME}.ext
+cp ${CERTNAME}.key $CAKey/ -v
+cp ${CERTNAME}.pem $CACRT/ -v
+openssl ocsp -CAfile ${CA}/CA-IT.pem -issuer ${CA}/CA-IT.pem -cert ${CERTNAME}.pem -url http://127.0.0.1:8081/ -resp_text -noverify 
