@@ -16,7 +16,7 @@ CONFIG_FILE = 'chat-llm.conf'
 # Vérification de la présence du fichier
 if not os.path.exists(CONFIG_FILE):
     print(f"Erreur : Le fichier '{CONFIG_FILE}' est introuvable.")
-    print("Veuillez le créer avec les sections [DEFAULT] appropriées.")
+    print("Veuillez le créer avec la section [DEFAULT] appropriée.")
     sys.exit(1)
 
 config = configparser.ConfigParser()
@@ -25,10 +25,9 @@ config.read(CONFIG_FILE)
 try:
     settings = config['DEFAULT']
     
-    VLLM_API_BASE = settings.get('VLLM_API_BASE')
+    API_BASE = settings.get('API_BASE')
     MODEL_NAME = settings.get('MODEL_NAME')
     SYSTEM_PROMPT = settings.get('SYSTEM_PROMPT', "Tu es un assistant utile, clair et concis.")
-    # On convertit en entier car le fichier conf renvoie des chaînes
     MAX_HISTORY = int(settings.get('MAX_HISTORY', 10))
 
 except KeyError as e:
@@ -44,7 +43,7 @@ except ValueError:
 
 def chat():
     print(f"Chat CLI - {MODEL_NAME}")
-    print(f"Endpoint : {VLLM_API_BASE}")
+    print(f"Endpoint : {API_BASE}")
     print("Tape '/bye' pour quitter ou 'clear' pour réinitialiser.\n")
 
     system_prompt = {"role": "system", "content": SYSTEM_PROMPT}
@@ -56,10 +55,12 @@ def chat():
             
             if not user_input: continue
             if user_input.lower() in ("exit", "quit", "/bye"):
-                print("Bye"); break
+                print("Bye")
+                break
             if user_input.lower() == "clear":
                 messages = [system_prompt]
-                print("Historique effacé.\n"); continue
+                print("Historique effacé.\n")
+                continue
 
             messages.append({"role": "user", "content": user_input})
 
@@ -75,7 +76,7 @@ def chat():
             first_token_time = None
 
             response = requests.post(
-                f"{VLLM_API_BASE}/chat/completions",
+                f"{API_BASE}/chat/completions",
                 headers={"Content-Type": "application/json"},
                 json=payload,
                 stream=True,
@@ -88,18 +89,28 @@ def chat():
 
             for line in response.iter_lines():
                 if line:
-                    line_data = line.decode('utf-8').removeprefix('data: ')
-                    if line_data == '[DONE]': break
+                    decoded_line = line.decode('utf-8').strip()
+                    if not decoded_line.startswith('data: '):
+                        continue
+                        
+                    line_data = decoded_line.removeprefix('data: ').strip()
+                    
+                    if line_data == '[DONE]': 
+                        break
                     
                     try:
                         chunk = json.loads(line_data)
-                        content = chunk['choices'][0]['delta'].get('content', '')
+                        # llama-server renvoie parfois des chunks sans la clé "content"
+                        delta = chunk.get('choices', [{}])[0].get('delta', {})
+                        content = delta.get('content', '')
                         
-                        if content and first_token_time is None:
-                            first_token_time = time.perf_counter()
-                        
-                        print(content, end="", flush=True)
-                        full_assistant_msg += content
+                        if content:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                            
+                            print(content, end="", flush=True)
+                            full_assistant_msg += content
+                            
                     except json.JSONDecodeError:
                         continue
 
@@ -112,13 +123,15 @@ def chat():
 
             messages.append({"role": "assistant", "content": full_assistant_msg})
 
+            # Gestion de la limite d'historique (système + x derniers messages)
             if len(messages) > MAX_HISTORY:
                 messages = [system_prompt] + messages[-(MAX_HISTORY-1):]
 
         except KeyboardInterrupt:
-            print("\nBye"); sys.exit(0)
+            print("\nBye")
+            sys.exit(0)
         except requests.exceptions.ConnectionError:
-            print(f"\nErreur : Impossible de se connecter à {VLLM_API_BASE}")
+            print(f"\nErreur : Impossible de se connecter à {API_BASE}")
         except Exception as e:
             print(f"\nErreur : {e}")
 
