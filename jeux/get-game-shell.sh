@@ -16,9 +16,9 @@ apt update &> /dev/null
 apt -y install gettext man-db procps psmisc nano tree ncal x11-apps wget &> /dev/null
 
 echo "Creation d'un utilisateur dedie a GameShell"
-if [[ $(grep -c 'gameshell:x:4242' /etc/passwd) != 1 ]]
+if [[ $(grep -c 'gameshell:x:942' /etc/passwd) != 1 ]]
 then
-	useradd -m -s /home/gameshell/gameshell.sh -u 4242 -N gameshell
+	useradd -m -r -s /home/gameshell/gameshell.sh -u 942 -N gameshell
 fi
 
 echo "Recuperation du jeu"
