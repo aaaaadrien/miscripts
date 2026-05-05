@@ -21,7 +21,6 @@ if [[ $REPONSE == "y" ]]
 then
 	mkdir /var/tmp/kerneltest/
 	cd /var/tmp/kerneltest/ || exit
-	rm -rf /var/tmp/kerneltest/*rpm
 	koji download-build --arch="$(uname -m)" "$TRYTOGET"
 	sudo dnf update kernel-*.rpm
 fi
