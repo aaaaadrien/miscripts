@@ -21,8 +21,13 @@ if [[ $REPONSE == "y" ]]
 then
 	mkdir /var/tmp/kerneltest/
 	cd /var/tmp/kerneltest/ || exit
-	koji download-build --arch="$(uname -m)" "$TRYTOGET"
-	sudo dnf update kernel-*.rpm
+
+	until timeout 30 koji download-build --arch="$(uname -m)" "$TRYTOGET" 
+    do
+        echo "Relancement du dl car koji est lent"
+    done
+	
+    sudo dnf update kernel-*.rpm && rm -rf /var/tmp/kerneltest/*.rpm
 fi
 
 
