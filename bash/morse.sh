@@ -28,13 +28,15 @@ play_tone() {
   play -q -n synth "$1" sin "$FREQ" vol "$VOLUME"
 }
 
-text=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+text=$(echo "$@" | tr '[:lower:]' '[:upper:]')
 
+echo -n "TEXT : "
 for (( i=0; i<${#text}; i++ )); do
   char="${text:$i:1}"
 
   if [[ "$char" == " " ]]; then
     sleep "$WORD_GAP"
+    echo -n "$char"
     continue
   fi
 
@@ -58,5 +60,9 @@ for (( i=0; i<${#text}; i++ )); do
     fi
   done
 
+  echo -n "$char"
+
   sleep "$LETTER_GAP"
 done
+
+echo ""
