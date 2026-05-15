@@ -265,6 +265,7 @@ detect_os() {
         arch|manjaro|endeavouros|cachyos|garuda|artix)      echo "arch_family"    ;;
         mageia)                                             echo "mageia"         ;;
         opensuse-*)                                         echo "opensuse"       ;;
+        solus)                                              echo "solus"       ;;
         freebsd)                                            echo "freebsd"        ;;
         *)
             case "${id_like}" in
@@ -449,6 +450,22 @@ fstrim -av || true
 ENDSSH
 }
 
+update_solus() {
+    local ip="$1"
+    log "  -- Mise à jour Solus"
+    log_section "VM ${_CURRENT_VMID:-?} Solus ${ip}"
+    ssh ${SSH_OPTS} "root@${ip}" bash -s >> "${LOG_FILE}" 2>&1 <<'ENDSSH'
+set -e
+eopkg update-repo
+eopkg upgrade -y
+eopkg delete-cache -y
+if command -v flatpak &>/dev/null; then
+    flatpak update --noninteractive -y || true
+fi
+fstrim -av || true
+ENDSSH
+}
+
 ## Inconnu = erreur
 update_unknown() {
     local ip="$1"
@@ -528,6 +545,7 @@ process_vm() {
         arch_family)    update_arch_family "${ip}"            || update_rc=$? ;;
         mageia)         update_mageia "${ip}"                 || update_rc=$? ;;
         opensuse)       update_opensuse "${ip}"               || update_rc=$? ;;
+        solus)          update_solus "${ip}"                  || update_rc=$? ;;
         freebsd)        update_freebsd                        || update_rc=$? ;;
         unknown:*)      update_unknown "${ip}" "${os_family}" || update_rc=$? ;;
     esac
