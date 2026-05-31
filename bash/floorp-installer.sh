@@ -7,6 +7,12 @@ FLOORP_DIR="/opt/floorp/"
 DESKTOP_NAME="/usr/local/share/applications/floorp.desktop"
 TMP_DIR="/var/tmp"
 
+if [ "$EUID" -ne 0 ]
+then
+  echo "Must be run as root" >&2
+  exit 2
+fi
+
 display_help() {
     echo "Usage: $0 [-i | -u | -r]"
     echo "  -i : Install Floorp"
