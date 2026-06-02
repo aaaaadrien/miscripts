@@ -245,7 +245,7 @@ detect_os() {
     os_release=$(ssh ${SSH_OPTS} "root@${ip}" \
         'cat /etc/os-release 2>/dev/null || cat /usr/lib/os-release 2>/dev/null || echo "ID=unknown"')
 
-    local id; id=$(echo "${os_release}" | grep -oP '(?<=^ID=)[^\n]+' | tr -d '"' | head -1 | tr '[:upper:]' '[:lower:]')
+    local id; id=$(echo "${os_release}" | grep -oP '(?<=^ID=)[^\n]+' | tr -d '"' | tr -d "'" | head -1 | tr '[:upper:]' '[:lower:]')
     local id_like; id_like=$(echo "${os_release}" | grep -oP '(?<=^ID_LIKE=)[^\n]+' | tr -d '"' | head -1 | tr '[:upper:]' '[:lower:]')
     local variant_id; variant_id=$(echo "${os_release}" | grep -oP '(?<=^VARIANT_ID=)[^\n]+' | tr -d '"' | head -1 | tr '[:upper:]' '[:lower:]')
 
