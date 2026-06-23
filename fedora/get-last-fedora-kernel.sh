@@ -22,10 +22,17 @@ then
 	mkdir /var/tmp/kerneltest/
 	cd /var/tmp/kerneltest/ || exit
 
-	until timeout 30 koji download-build --arch="$(uname -m)" "$TRYTOGET" 
-    do
-        echo "Relancement du dl car koji est lent"
-    done
+    timeout 180 koji download-build --arch="$(uname -m)" "$TRYTOGET"
+    STATUS=$?
+
+    if [ $STATUS -ne 0 ]
+        then
+
+     	until timeout 30 koji download-build --arch="$(uname -m)" "$TRYTOGET" 
+        do
+            echo "Relancement du dl car koji est lent"
+        done
+    fi
 	
     sudo dnf update kernel-*.rpm && rm -rf /var/tmp/kerneltest/*.rpm
 fi
