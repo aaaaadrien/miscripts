@@ -175,9 +175,9 @@ EOF
 
     echo ""
     echo "[INFO]   CA '${domain}' créée avec succès"
-    echo "[INFO]     ${ca_dir}/ca.key  -> clé privée  (ne jamais distribuer)"
-    echo "[INFO]     ${ca_dir}/ca.crt  -> certificat  (à distribuer aux clients)"
-    echo "[INFO]     ${ca_dir}/ca.pem  -> PEM combiné (clé + cert)"
+    echo "[INFO]     ${ca_dir}/${domain}-ca.key  -> clé privée  (ne jamais distribuer)"
+    echo "[INFO]     ${ca_dir}/${domain}-ca.crt  -> certificat  (à distribuer aux clients)"
+    echo "[INFO]     ${ca_dir}/${domain}-ca.pem  -> PEM combiné (clé + cert)"
 }
 
 #  --install-ca
