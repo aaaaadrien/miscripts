@@ -65,7 +65,9 @@ load_local_cas() {
     LOCAL_CAS=()
     [[ -d "CA" ]] || return 0
     while IFS= read -r dir; do
-        [[ -f "${dir}/ca.crt" ]] && LOCAL_CAS+=("$(basename "$dir")")
+        local dname
+        dname="$(basename "$dir")"
+        [[ -f "${dir}/${dname}-ca.crt" ]] && LOCAL_CAS+=("$dname")
     done < <(find CA -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
 }
 
