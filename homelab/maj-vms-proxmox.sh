@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # Config
-PVE_HOSTS=("pve241")         # tableau de PVE hosts (modifiable via --pve)
+PVE_HOSTS=("pve241" "pve243")         # tableau de PVE hosts (modifiable via --pve)
 VM_IDS=()                    # tableau des VMID à traiter (rempli via --id)
 BOOT_TIMEOUT=40              # secondes max pour attendre le démarrage
 REBOOT_TIMEOUT=40            # secondes max pour attendre le reboot
