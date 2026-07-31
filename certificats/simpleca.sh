@@ -8,6 +8,7 @@
 #    ./simpleca.sh --install-ca
 #    ./simpleca.sh --remove-ca
 #    ./simpleca.sh --new-cert <fqdn> [fqdn2 ...]
+#    ./simpleca.sh --squid-ca
 # ============================================================
 
 set -euo pipefail
@@ -422,6 +423,84 @@ EOF
     echo "[INFO]     ${base}-fullchain.pem  -> cert + CA"
 }
 
+#  --squid-ca
+cmd_squid_ca() {
+    echo ""
+    echo "=== Génération d'un PEM CA pour Squid (ssl-bump) ==="
+    echo ""
+
+    load_local_cas
+    [[ ${#LOCAL_CAS[@]} -gt 0 ]] \
+        || { echo "[ERREUR] Aucune CA locale trouvée. Créez-en une avec : $0 --create-ca" >&2; exit 1; }
+
+    local domain
+    if [[ ${#LOCAL_CAS[@]} -eq 1 ]]; then
+        domain="${LOCAL_CAS[0]}"
+        echo "[INFO]   CA utilisée : ${domain}"
+    else
+        select_menu "Quelle CA utiliser pour Squid ?" "${LOCAL_CAS[@]}"
+        domain="$MENU_RESULT"
+    fi
+
+    local ca_dir="CA/${domain}"
+    local ca_base="${ca_dir}/${domain}-ca"
+    [[ -f "${ca_base}.crt" && -f "${ca_base}.key" ]] \
+        || { echo "[ERREUR] CA introuvable : ${ca_base}.crt / .key" >&2; exit 1; }
+
+    local squid_dir="squid/${domain}"
+    mkdir -p "$squid_dir"
+    chmod 700 "$squid_dir"
+    local squid_key="${squid_dir}/${domain}-squid-ca.key"
+    local squid_pem="${squid_dir}/${domain}-squid-ca.pem"
+
+    if [[ -f "${squid_pem}" ]]; then
+        echo "[WARN]   Un PEM Squid existe déjà pour '${domain}'."
+        echo -n "? Ecraser ? [o/N] : "
+        read -r confirm
+        [[ "$confirm" =~ ^[oO]$ ]] || { echo "[INFO]   Annulé."; return 0; }
+    fi
+
+    echo "[INFO]   Déchiffrement de la clé CA (saisissez la passphrase de la CA)..."
+    openssl rsa -in "${ca_base}.key" -out "${squid_key}"
+    chmod 600 "${squid_key}"
+
+    echo "[INFO]   Génération du PEM combiné (clé en clair + certificat CA)..."
+    cat "${squid_key}" "${ca_base}.crt" > "${squid_pem}"
+    chmod 600 "${squid_pem}"
+
+    # On ne garde que le PEM final, pas la clé en clair isolée
+    rm -f "${squid_key}"
+
+    echo ""
+    echo "[INFO]   Fichier Squid généré : ${squid_pem}"
+    echo "[INFO]   Vérification..."
+    openssl x509 -in "${squid_pem}" -noout -subject -issuer -dates
+    if openssl rsa -in "${squid_pem}" -noout -check 2>/dev/null; then
+        echo "[INFO]   Clé privée OK (non chiffrée)"
+    else
+        echo "[ERREUR] La clé privée du PEM Squid semble invalide." >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "[WARN]   Ce fichier contient une clé privée EN CLAIR."
+    echo "[WARN]     Protégez-le : chmod 600, propriétaire root (ou l'utilisateur squid), hors dépôt git."
+    echo "[WARN]   Distribuez ${ca_base}.crt (PAS ce PEM) aux clients/postes pour qu'ils fassent confiance à Squid."
+    echo ""
+    echo "[INFO]   Config Squid (squid.conf) :"
+    echo "[INFO]     http_port 3129 ssl-bump \\"
+    echo "[INFO]       cert=$(pwd)/${squid_pem} \\"
+    echo "[INFO]       generate-host-certificates=on dynamic_cert_mem_cache_size=4MB"
+    echo "[INFO]     acl step1 at_step SslBump1"
+    echo "[INFO]     ssl_bump peek step1"
+    echo "[INFO]     ssl_bump bump all"
+    echo "[INFO]     sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB"
+    echo ""
+    echo "[INFO]   Pensez à initialiser la base sslcrtd si ce n'est pas déjà fait :"
+    echo "[INFO]     /usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB"
+    echo "[INFO]     chown -R squid:squid /var/lib/squid/ssl_db"
+}
+
 #  Aide
 usage() {
     echo ""
@@ -432,6 +511,7 @@ usage() {
     echo "  ./simpleca.sh --new-cert <fqdn> [fqdn2 ...]   Generer un certificat serveur"
     echo "  ./simpleca.sh --install-ca                    Installer la CA dans le systeme"
     echo "  ./simpleca.sh --remove-ca                     Supprimer la CA du systeme"
+    echo "  ./simpleca.sh --squid-ca                      Generer un PEM CA pour Squid (ssl-bump)"
     echo "  ./simpleca.sh -h, --help                      Afficher cette aide"
     echo ""
     echo "Exemples :"
@@ -440,6 +520,7 @@ usage() {
     echo "  ./simpleca.sh --new-cert srv01.linuxtricks.lan www.linuxtricks.lan"
     echo "  sudo ./simpleca.sh --install-ca"
     echo "  sudo ./simpleca.sh --remove-ca"
+    echo "  ./simpleca.sh --squid-ca"
     echo ""
     exit 0
 }
@@ -454,6 +535,7 @@ case "$1" in
     --install-ca) cmd_install_ca ;;
     --remove-ca)  cmd_remove_ca ;;
     --new-cert)   shift; cmd_new_cert "$@" ;;
+    --squid-ca)   cmd_squid_ca ;;
     -h|--help)    usage ;;
     *)            echo "[ERREUR] Option inconnue : '$1'  (--help pour l'aide)" >&2; exit 1 ;;
 esac
