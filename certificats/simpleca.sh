@@ -303,21 +303,7 @@ cmd_new_cert() {
     [[ ${#LOCAL_CAS[@]} -gt 0 ]] \
         || { echo "[ERREUR] Aucune CA locale trouvée. Créez-en une avec : $0 --create-ca" >&2; exit 1; }
 
-    local domain
-    if [[ ${#LOCAL_CAS[@]} -eq 1 ]]; then
-        domain="${LOCAL_CAS[0]}"
-        echo "[INFO]   CA utilisée : ${domain}"
-    else
-        select_menu "Quelle CA doit signer ce certificat ?" "${LOCAL_CAS[@]}"
-        domain="$MENU_RESULT"
-    fi
-
-    [[ -f "CA/${domain}/${domain}-ca.crt" ]] \
-        || { echo "[ERREUR] Certificat CA introuvable : CA/${domain}/${domain}-ca.crt" >&2; exit 1; }
-    [[ -f "CA/${domain}/${domain}-ca.key" ]] \
-        || { echo "[ERREUR] Clé CA introuvable : CA/${domain}/${domain}-ca.key" >&2; exit 1; }
-
-    ask_default "Durée de validité (jours)" "365"
+    ask_default "Durée de validité (jours)" "3650"
     local cert_days="$REPLY"
     [[ "$cert_days" =~ ^[0-9]+$ && "$cert_days" -gt 0 ]] \
         || { echo "[ERREUR] Durée invalide : $cert_days" >&2; exit 1; }
@@ -342,6 +328,49 @@ cmd_new_cert() {
         || { echo "[ERREUR] Aucun FQDN valide fourni." >&2; exit 1; }
 
     local main_fqdn="${valid_fqdns[0]}"
+
+    # Auto-détection de la CA correspondant au domaine du FQDN
+    # (correspondance suffixe la plus longue parmi les CAs locales)
+    local domain=""
+    local -a matches=()
+    for ca in "${LOCAL_CAS[@]}"; do
+        if [[ "$main_fqdn" == "$ca" || "$main_fqdn" == *".${ca}" ]]; then
+            matches+=("$ca")
+        fi
+    done
+
+    if [[ ${#matches[@]} -gt 0 ]]; then
+        # Garde la correspondance la plus spécifique (nom le plus long)
+        domain="${matches[0]}"
+        for m in "${matches[@]}"; do
+            [[ ${#m} -gt ${#domain} ]] && domain="$m"
+        done
+        # En cas d'égalité entre plusieurs matches de même longueur -> ambiguïté, on redemande
+        local -a same_length=()
+        for m in "${matches[@]}"; do
+            [[ ${#m} -eq ${#domain} ]] && same_length+=("$m")
+        done
+        if [[ ${#same_length[@]} -gt 1 ]]; then
+            echo "[WARN]   Plusieurs CAs correspondent au domaine de '${main_fqdn}'."
+            select_menu "Quelle CA doit signer ce certificat ?" "${same_length[@]}"
+            domain="$MENU_RESULT"
+        else
+            echo "[INFO]   CA détectée automatiquement pour '${main_fqdn}' : ${domain}"
+        fi
+    elif [[ ${#LOCAL_CAS[@]} -eq 1 ]]; then
+        domain="${LOCAL_CAS[0]}"
+        echo "[INFO]   Aucune CA ne correspond au domaine de '${main_fqdn}', utilisation de la seule CA disponible : ${domain}"
+    else
+        echo "[WARN]   Aucune CA locale ne correspond au domaine de '${main_fqdn}'."
+        select_menu "Quelle CA doit signer ce certificat ?" "${LOCAL_CAS[@]}"
+        domain="$MENU_RESULT"
+    fi
+
+    [[ -f "CA/${domain}/${domain}-ca.crt" ]] \
+        || { echo "[ERREUR] Certificat CA introuvable : CA/${domain}/${domain}-ca.crt" >&2; exit 1; }
+    [[ -f "CA/${domain}/${domain}-ca.key" ]] \
+        || { echo "[ERREUR] Clé CA introuvable : CA/${domain}/${domain}-ca.key" >&2; exit 1; }
+
     local cert_dir="certs/${main_fqdn}"
     local base="${cert_dir}/${main_fqdn}"
     local ca_dir="CA/${domain}"
