@@ -122,7 +122,7 @@ done
 
 # Si --id non fourni, appliquer la valeur par défaut 601-630 (a améliorer)
 if (( ${#VM_IDS[@]} == 0 )); then
-    parse_ids "601-630"
+    parse_ids "601-640"
 fi
 
 

@@ -1,5 +1,22 @@
 #!/bin/bash
 
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-d DEST] [-r [cli|gui]] [-l] [-h]
+
+  -d DEST      Destination : LOCAL1 / LOCAL2 / NFS / SSH (sinon demandé)
+  -r [MODE]    Restauration : cli (défaut) ou gui
+  -l           Lister les backups d'un repo (HOME/DATA)
+  -h, --help   Affiche cette aide
+
+Sans option : lance la sauvegarde + prune + ls + maintenance.
+EOF
+}
+
+for arg in "$@"; do
+    [[ "$arg" == "-h" || "$arg" == "--help" ]] && { usage; exit 0; }
+done
+
 # Chargement de la conf
 CONF_FILE="$(dirname "$0")/plakar-backup.conf"
 [[ -f "$CONF_FILE" ]] || { echo "Fichier de conf introuvable : $CONF_FILE"; exit 1; }
@@ -7,10 +24,11 @@ source "$CONF_FILE"
 
 # Option -d pour passer la destination en argument
 # Option -r pour lancer une restauration (cli|gui, cli par défaut)
-while getopts "d:r" opt; do
+while getopts "d:rl" opt; do
     case $opt in
         d) DEST="$OPTARG" ;;
         r) RESTORE=1 ;;
+        l) LIST=1 ;;
     esac
 done
 shift $((OPTIND-1))
@@ -71,6 +89,15 @@ unmount_dest() {
     [[ "$DEST" == "SSH" ]] && fusermount -u "$SSH_MOUNT_POINT"
 }
 
+# Mode Listing
+if [[ "$LIST" == "1" ]]; then
+    read -p "Quel repo lister (HOME/DATA) ? " REPO
+    echo "### LISTING $REPO ###"
+    plakar at "$pathsav/plakar-$REPO" ls
+    unmount_dest
+    exit 0
+fi
+
 # Mode Restauration
 if [[ "$RESTORE" == "1" ]]; then
     RESTORE_MODE="${1:-cli}"
@@ -94,14 +121,6 @@ if [[ "$RESTORE" == "1" ]]; then
             ;;
     esac
 
-    unmount_dest
-    exit 0
-fi
-
-# Mode UI
-if [[ "$1" == "ui" ]]; then
-    read -p "Quel repo voir (HOME/DATA) ? " REPO
-    plakar at "$pathsav/plakar-$REPO" ui
     unmount_dest
     exit 0
 fi
