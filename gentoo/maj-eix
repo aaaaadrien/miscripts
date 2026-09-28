@@ -1,0 +1,17 @@
+#!/bin/bash
+# Prerequis : mkdir /etc/portage/postsync.d
+# Prérequis : emerge -av app-portage/eix
+# Placer ce script dans : /etc/portage/postsync.d/
+# Rendre exécutable : chmod +x /etc/portage/postsync.d/maj-eix
+# Permet de MàJ la base eix automatiquement après un emerge --sync 
+
+
+if [[ -e /var/cache/eix/portage.eix ]]
+then
+    rsync -ca /var/cache/eix/portage.eix /var/cache/eix/previous.eix
+fi
+eix-update
+if [[ -e /var/cache/eix/previous.eix ]]
+then
+    eix-diff
+fi
