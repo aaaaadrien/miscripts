@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export PLAKAR_INSECURE_PLAINTEXT=ok
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [-d DEST] [-r [cli|gui]] [-l] [-h]
