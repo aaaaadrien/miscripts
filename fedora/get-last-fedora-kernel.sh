@@ -9,7 +9,7 @@ fi
 echo Recherche kernel branche : "$BRANCH"
 koji list-builds --package=kernel --pattern "kernel-$BRANCH.*$(rpm -E %fedora)"
 
-TRYTOGET=$(koji list-builds --package=kernel --pattern "kernel-$BRANCH.*$(rpm -E %fedora)" | tail -1 | awk '{ print $1; }')
+TRYTOGET=$(koji list-builds --package=kernel --pattern "kernel-$BRANCH.*$(rpm -E %fedora)" | grep COMPLETE | tail -1 | awk '{ print $1; }')
 
 
 echo -e "\n\n"
