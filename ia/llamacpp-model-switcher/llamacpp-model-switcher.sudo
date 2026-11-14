@@ -1,0 +1,20 @@
+# Règle sudoers pour llamacpp-model-switcher.
+#
+# Autorise l'utilisateur système "llamacpp" à exécuter SANS mot de passe
+# uniquement les deux commandes nécessaires pour appliquer un changement de
+# modèle : recharger la configuration systemd et redémarrer le service
+# llamacpp.service. Aucun autre droit n'est accordé (pas de "systemctl
+# restart" générique, pas de shell root, etc.).
+#
+# Installation : copier ce fichier dans /etc/sudoers.d/llamacpp-model-switcher
+#
+# Les chemins ci-dessous (/usr/bin/systemctl) doivent correspondre très
+# exactement à ceux utilisés par le script Python (voir SYSTEMCTL_BIN dans
+# llamacpp-model-switcher) et à l'emplacement réel du binaire sur votre
+# distribution : vérifiez avec `command -v systemctl` et ajustez les deux
+# fichiers ensemble si besoin (ex: /bin/systemctl sur certains systèmes).
+
+Defaults:llamacpp !requiretty
+
+llamacpp ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
+llamacpp ALL=(root) NOPASSWD: /usr/bin/systemctl restart llamacpp.service

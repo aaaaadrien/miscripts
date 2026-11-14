@@ -1,0 +1,17 @@
+[Unit]
+Description=Llamacpp Model Switcher - interface web de selection du modele llama-server
+After=network.target
+
+[Service]
+Type=simple
+User=llamacpp
+Group=llamacpp
+ExecStart=/opt/llamacpp-model-switcher/bin/llamacpp-model-switcher
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=/opt/llamacpp-model-switcher
+
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

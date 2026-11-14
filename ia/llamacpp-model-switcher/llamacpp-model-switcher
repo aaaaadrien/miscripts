@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""
+Appli web (stdlib uniquement, pas de pip install, pas de base de données)
+pour gérer plusieurs configurations de lancement de llama-server dans
+/etc/systemd/system/llamacpp.service.
+
+Toutes les configurations (nom + ligne ExecStart complète + laquelle est
+active) sont stockées DIRECTEMENT dans le fichier de service, à l'intérieur
+d'un "bloc managé" délimité par des marqueurs : le script n'écrit jamais en
+dehors de ce bloc, le reste du fichier n'est jamais touché. Chaque
+configuration est représentée par deux lignes :
+
+      # @switcher-name: unsloth/Qwen3.6-35B-A3B-GGUF
+      ExecStart=/opt/llamacpp/bin/llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_S ....
+
+(la ligne ExecStart est commentée si la configuration n'est pas active).
+
+Au premier lancement, si aucun bloc managé n'existe encore, les lignes
+ExecStart déjà présentes dans le fichier (actives ou commentées) sont
+automatiquement récupérées et transformées dans ce format, sans rien casser.
+
+Ce programme est conçu pour tourner en tant qu'utilisateur système dédié
+(ex: "llamacpp"), PAS en root. Il a besoin de deux délégations de
+privilèges minimales, fournies par les fichiers compagnons :
+  - une ACL POSIX sur /etc/systemd/system/llamacpp.service lui donnant le
+    droit d'écriture sur ce seul fichier (voir le Makefile / setfacl) ;
+  - une règle sudoers NOPASSWD limitée à "systemctl daemon-reload" et
+    "systemctl restart llamacpp.service" (voir llamacpp-model-switcher.sudo).
+
+Usage (démarrage manuel pour test) :
+    llamacpp-model-switcher
+Puis ouvrir http://<ip-machine>:8089
+
+En production, ce programme est lancé par le service systemd
+llamacpp-model-switcher.service sous l'utilisateur "llamacpp".
+"""
+
+import os
+import re
+import sys
+import html
+import shutil
+import datetime
+import subprocess
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+SERVICE_FILE = "/etc/systemd/system/llamacpp.service"
+SERVICE_NAME = "llamacpp.service"
+HOST = "0.0.0.0"            # écoute sur toutes les interfaces ; mettre "127.0.0.1" pour n'écouter qu'en local
+PORT = 8089
+
+MARK_START = "# >>> llamacpp-switcher managed block - ne pas éditer à la main >>>"
+MARK_END = "# <<< llamacpp-switcher managed block <<<"
+
+NAME_MARKER_RE = re.compile(r'^\s*#\s*@switcher-name:\s*(.*?)\s*$')
+EXEC_LINE_RE = re.compile(r'^\s*(?P<hash>#\s*)?ExecStart=(?P<cmd>.*)$')
+HF_RE = re.compile(r'-hf\s+(\S+)')
+
+
+# --------------------------------------------------------------------------
+# Utilitaires système
+# --------------------------------------------------------------------------
+
+def warn_if_root():
+    """Ce programme n'a plus besoin de root : il s'appuie sur une ACL pour
+    écrire le fichier de service et sur sudo (règles ciblées) pour
+    recharger/redémarrer systemd. Tourner en root fonctionnerait mais
+    contredit le principe de moindre privilège visé par cette installation."""
+    if os.geteuid() == 0:
+        print("Avertissement : lancé en root. Ce n'est pas nécessaire ni "
+              "recommandé. Préférez l'utilisateur système 'llamacpp' avec "
+              "l'ACL et les règles sudo fournies.", file=sys.stderr)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+def backup_file():
+    os.makedirs("/tmp", exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_path = f"/tmp/{SERVICE_NAME}.bak.{ts}"
+    shutil.copy2(SERVICE_FILE, backup_path)
+    return backup_path
+
+
+def human_delta(dt):
+    if dt is None:
+        return None
+    now = datetime.datetime.now()
+    delta = now - dt
+    secs = max(int(delta.total_seconds()), 0)
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}j")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins or not parts:
+        parts.append(f"{mins}min")
+    return " ".join(parts)
+
+
+def get_service_status():
+    status = {
+        "active_state": "inconnu",
+        "enabled_state": "inconnu",
+        "active_since": None,
+        "active_since_human": None,
+        "listening_since": None,
+        "listening_since_human": None,
+        "listening_url": None,
+    }
+
+    r = run(["systemctl", "is-active", SERVICE_NAME])
+    status["active_state"] = (r.stdout or r.stderr or "inconnu").strip()
+
+    r = run(["systemctl", "is-enabled", SERVICE_NAME])
+    status["enabled_state"] = (r.stdout or r.stderr or "inconnu").strip()
+
+    r = run(["systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", SERVICE_NAME])
+    raw = (r.stdout or "").strip()
+    m = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', raw)
+    if m:
+        try:
+            dt = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            status["active_since"] = dt
+            status["active_since_human"] = human_delta(dt)
+        except ValueError:
+            pass
+
+    if status["active_state"] == "active" and status["active_since"] is not None:
+        since_str = status["active_since"].strftime("%Y-%m-%d %H:%M:%S")
+        r = run(["journalctl", "-u", SERVICE_NAME, "--since", since_str,
+                 "-o", "short-iso", "--no-pager"])
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if re.search(r'listening on http', line, re.IGNORECASE):
+                    m2 = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', line)
+                    if m2:
+                        try:
+                            dt2 = datetime.datetime.strptime(m2.group(1), "%Y-%m-%dT%H:%M:%S")
+                            status["listening_since"] = dt2
+                            status["listening_since_human"] = human_delta(dt2)
+                        except ValueError:
+                            pass
+                    urlm = re.search(r'(https?://\S+)', line)
+                    if urlm:
+                        status["listening_url"] = urlm.group(1).rstrip(" -")
+                    break  # premier match après le démarrage courant
+
+    return status
+
+
+def guess_name(command):
+    m = HF_RE.search(command)
+    if m:
+        return m.group(1)
+    parts = command.strip().split()
+    return parts[0] if parts else "config"
+
+
+# --------------------------------------------------------------------------
+# Lecture / écriture des configurations directement dans le fichier service
+# --------------------------------------------------------------------------
+
+def _locate_block(lines):
+    start = end = None
+    for i, l in enumerate(lines):
+        if l.strip() == MARK_START:
+            start = i
+        elif l.strip() == MARK_END:
+            end = i
+    return start, end
+
+
+def read_configs():
+    """Retourne la liste des configurations (ordre = ordre dans le fichier).
+    Chaque élément : {"name": str, "command": str, "active": bool}.
+    L'index dans cette liste sert d'identifiant pour les actions (le fichier
+    est toujours relu avant chaque affichage/action)."""
+    if not os.path.isfile(SERVICE_FILE):
+        raise FileNotFoundError(f"Fichier {SERVICE_FILE} introuvable.")
+
+    with open(SERVICE_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    start, end = _locate_block(lines)
+    scan_lines = lines[start + 1:end] if (start is not None and end is not None and end > start) else lines
+
+    configs = []
+    pending_name = None
+    for line in scan_lines:
+        if line.strip() in (MARK_START, MARK_END):
+            continue
+        m = NAME_MARKER_RE.match(line)
+        if m:
+            pending_name = m.group(1)
+            continue
+        m2 = EXEC_LINE_RE.match(line)
+        if m2:
+            cmd = m2.group("cmd").strip()
+            name = pending_name if pending_name else guess_name(cmd)
+            configs.append({
+                "name": name,
+                "command": cmd,
+                "active": m2.group("hash") is None,
+            })
+            pending_name = None
+        else:
+            pending_name = None
+    return configs
+
+
+def build_block_lines(configs):
+    block = [MARK_START + "\n"]
+    for c in configs:
+        block.append(f"# @switcher-name: {c['name']}\n")
+        line = f"ExecStart={c['command']}"
+        if not c["active"]:
+            line = "#" + line
+        block.append(line + "\n")
+    block.append(MARK_END + "\n")
+    return block
+
+
+def write_configs(configs):
+    """Régénère le bloc managé dans le fichier de service à partir de la
+    liste de configurations fournie. Ne redémarre PAS le service."""
+    if not os.path.isfile(SERVICE_FILE):
+        raise FileNotFoundError(f"Fichier {SERVICE_FILE} introuvable.")
+
+    with open(SERVICE_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    start, end = _locate_block(lines)
+    new_block = build_block_lines(configs)
+
+    if start is not None and end is not None and end >= start:
+        new_lines = lines[:start] + new_block + lines[end + 1:]
+    else:
+        # Pas encore de bloc managé : on retire les anciennes lignes
+        # ExecStart "brutes" (et d'éventuels marqueurs de nom orphelins)
+        # et on insère le bloc à leur place.
+        filtered = []
+        insertion_index = None
+        service_section_index = None
+        for l in lines:
+            if EXEC_LINE_RE.match(l) or NAME_MARKER_RE.match(l):
+                if insertion_index is None:
+                    insertion_index = len(filtered)
+                continue
+            filtered.append(l)
+            if l.strip() == "[Service]" and service_section_index is None:
+                service_section_index = len(filtered)
+        if insertion_index is None:
+            insertion_index = service_section_index if service_section_index is not None else len(filtered)
+        new_lines = filtered[:insertion_index] + new_block + filtered[insertion_index:]
+
+    backup_path = backup_file()
+    with open(SERVICE_FILE, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+    return backup_path
+
+
+def normalize_if_needed():
+    """Au tout premier lancement (pas encore de bloc managé), transforme les
+    lignes ExecStart déjà présentes dans le format marqué, sans changer
+    quel modèle est actif."""
+    with open(SERVICE_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    start, end = _locate_block(lines)
+    if start is not None and end is not None:
+        return  # déjà au bon format
+    configs = read_configs()
+    if not configs:
+        return  # rien à normaliser (fichier vierge de tout ExecStart)
+    write_configs(configs)
+
+
+SUDO_BIN = "/usr/bin/sudo"
+SYSTEMCTL_BIN = "/usr/bin/systemctl"
+
+
+def restart_service():
+    # Ces deux commandes doivent correspondre EXACTEMENT (chemins et
+    # arguments) aux règles NOPASSWD du fichier llamacpp-model-switcher.sudo,
+    # sans quoi sudo redemandera un mot de passe et échouera en tâche de
+    # fond. Si systemctl ou sudo ne sont pas dans /usr/bin sur votre
+    # distribution, adaptez les deux constantes ci-dessus ET le fichier
+    # .sudo en conséquence (vérifiez avec `command -v sudo systemctl`).
+    r1 = run([SUDO_BIN, "-n", SYSTEMCTL_BIN, "daemon-reload"])
+    if r1.returncode != 0:
+        return False, f"Erreur daemon-reload : {r1.stderr or r1.stdout}"
+    r2 = run([SUDO_BIN, "-n", SYSTEMCTL_BIN, "restart", SERVICE_NAME])
+    if r2.returncode != 0:
+        return False, f"Erreur restart : {r2.stderr or r2.stdout}"
+    return True, "Service redémarré."
+
+
+# --------------------------------------------------------------------------
+# Actions métier (appelées par les routes)
+# --------------------------------------------------------------------------
+
+def action_activate(idx):
+    configs = read_configs()
+    if idx < 0 or idx >= len(configs):
+        return False, "Configuration introuvable."
+    if configs[idx]["active"]:
+        return True, f"« {configs[idx]['name']} » est déjà active. Rien à faire."
+
+    for i, c in enumerate(configs):
+        c["active"] = (i == idx)
+
+    try:
+        backup_path = write_configs(configs)
+    except Exception as e:
+        return False, f"Erreur en écrivant le fichier de service : {e}"
+
+    ok, msg = restart_service()
+    if not ok:
+        return False, f"Sauvegarde : {backup_path}\n{msg}"
+    return True, f"Sauvegarde : {backup_path}\nConfiguration activée : {configs[idx]['name']}\n{msg}"
+
+
+def action_add(name, command):
+    if not name.strip() or not command.strip():
+        return False, "Nom et commande sont obligatoires."
+    configs = read_configs()
+    configs.append({"name": name.strip(), "command": command.strip(), "active": False})
+    try:
+        write_configs(configs)
+    except Exception as e:
+        return False, f"Erreur en écrivant le fichier de service : {e}"
+    return True, f"Configuration « {name} » ajoutée."
+
+
+def action_edit(idx, name, command):
+    configs = read_configs()
+    if idx < 0 or idx >= len(configs):
+        return False, "Configuration introuvable."
+    if not name.strip() or not command.strip():
+        return False, "Nom et commande sont obligatoires."
+
+    was_active = configs[idx]["active"]
+    command_changed = command.strip() != configs[idx]["command"]
+    configs[idx]["name"] = name.strip()
+    configs[idx]["command"] = command.strip()
+
+    try:
+        write_configs(configs)
+    except Exception as e:
+        return False, f"Erreur en écrivant le fichier de service : {e}"
+
+    if was_active and command_changed:
+        ok, msg = restart_service()
+        if not ok:
+            return False, f"Configuration modifiée mais {msg}"
+        return True, f"Configuration « {name} » modifiée et service redémarré."
+
+    return True, f"Configuration « {name} » modifiée."
+
+
+def action_delete(idx):
+    configs = read_configs()
+    if idx < 0 or idx >= len(configs):
+        return False, "Configuration introuvable."
+    if configs[idx]["active"]:
+        return False, "Impossible de supprimer la configuration active. Activez-en une autre d'abord."
+    removed = configs.pop(idx)
+    try:
+        write_configs(configs)
+    except Exception as e:
+        return False, f"Erreur en écrivant le fichier de service : {e}"
+    return True, f"Configuration « {removed['name']} » supprimée."
+
+
+# --------------------------------------------------------------------------
+# Rendu HTML
+# --------------------------------------------------------------------------
+
+STYLE = """
+:root {
+  --bg: #f5f5f7; --card-bg: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
+  --accent: #0071e3; --accent-hover: #0077ed; --border: #e5e5e7;
+  --active-bg: #e8f5e9; --active-border: #34c759; --danger: #ff3b30;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e; --card-bg: #2c2c2e; --text: #f5f5f7; --muted: #a1a1a6;
+    --border: #3a3a3c; --active-bg: #1f3a24; --active-border: #34c759;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text); padding: 2rem 1rem;
+}
+.container { max-width: 720px; margin: 0 auto; }
+h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+h2 { font-size: 1.05rem; margin: 0 0 0.75rem 0; }
+.subtitle { color: var(--muted); margin-top: 0; margin-bottom: 1.5rem; font-size: 0.9rem; }
+.card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 1.25rem; margin-bottom: 1.25rem; }
+.status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 1rem; font-size: 0.9rem; }
+.status-grid dt { color: var(--muted); }
+.status-grid dd { margin: 0; font-weight: 500; }
+.pill { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem;
+  font-weight: 600; }
+.pill-active { background: var(--active-bg); color: var(--active-border); }
+.pill-inactive { background: #3a3a3c22; color: var(--muted); }
+.pill-failed { background: #ff3b3022; color: var(--danger); }
+.model-row { display: flex; align-items: flex-start; padding: 0.6rem 0.5rem; border-radius: 8px;
+  border: 1px solid var(--border); margin-bottom: 0.5rem; }
+.model-row.active { background: var(--active-bg); border-color: var(--active-border); }
+.row-select { display: flex; align-items: flex-start; flex: 1; min-width: 0; cursor: pointer; }
+.row-select input[type=radio] { margin-right: 0.75rem; margin-top: 0.2rem; }
+.model-main { flex: 1; min-width: 0; }
+.model-name { font-weight: 600; font-size: 0.92rem; }
+.model-cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem;
+  color: var(--muted); word-break: break-all; margin-top: 0.15rem; }
+.badge { font-size: 0.72rem; color: var(--active-border); font-weight: 700; white-space: nowrap; }
+.row-actions { margin-left: 0.75rem; display: flex; gap: 0.4rem; flex-shrink: 0; }
+.row-actions a, .row-actions button { font-size: 0.78rem; padding: 0.25rem 0.55rem; border-radius: 6px;
+  border: 1px solid var(--border); background: transparent; color: var(--text); text-decoration: none;
+  cursor: pointer; }
+.row-actions .danger { color: var(--danger); border-color: var(--danger); }
+button.primary { background: var(--accent); color: white; border: none; padding: 0.7rem 1.4rem;
+  border-radius: 8px; font-size: 0.95rem; cursor: pointer; margin-top: 0.5rem; }
+button.primary:hover { background: var(--accent-hover); }
+label.field { display: block; margin-bottom: 0.75rem; font-size: 0.85rem; color: var(--muted); }
+input[type=text], textarea { width: 100%; padding: 0.55rem; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font-size: 0.9rem; margin-top: 0.25rem; font-family: inherit; }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; min-height: 4.5em;
+  resize: vertical; }
+pre { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.75rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
+.msg-ok { color: var(--active-border); } .msg-err { color: var(--danger); }
+a.back { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+"""
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Llamacpp - configurations</title>
+<style>{style}</style>
+</head>
+<body>
+<div class="container">
+  <h1>Llamacpp — configurations de lancement</h1>
+  <p class="subtitle">Fichier : {service_file}</p>
+
+  {message_block}
+
+  <div class="card" id="status-block">
+    {status_fragment}
+  </div>
+
+  <form method="post" action="/activate">
+    <div class="card">
+      <h2>Configurations enregistrées</h2>
+      {rows}
+      <button class="primary" type="submit">Activer la configuration sélectionnée</button>
+    </div>
+  </form>
+
+  <div class="card">
+    <h2>Ajouter une configuration</h2>
+    <form method="post" action="/add">
+      <label class="field">Nom
+        <input type="text" name="name" placeholder="ex: Qwen2.5-7B Q4" required>
+      </label>
+      <label class="field">Commande (sans le préfixe ExecStart=)
+        <textarea name="command" placeholder="/usr/bin/llama-server -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M --port 8080 --host 0.0.0.0" required></textarea>
+      </label>
+      <button class="primary" type="submit">Ajouter</button>
+    </form>
+  </div>
+</div>
+<script>
+setInterval(function() {{
+  fetch('/status').then(function(r) {{ return r.text(); }}).then(function(t) {{
+    document.getElementById('status-block').innerHTML = t;
+  }}).catch(function(){{}});
+}}, 5000);
+</script>
+</body>
+</html>
+"""
+
+EDIT_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modifier la configuration</title>
+<style>{style}</style>
+</head>
+<body>
+<div class="container">
+  <h1>Modifier une configuration</h1>
+  <p><a class="back" href="/">&larr; Retour</a></p>
+  <div class="card">
+    <form method="post" action="/edit">
+      <input type="hidden" name="idx" value="{idx}">
+      <label class="field">Nom
+        <input type="text" name="name" value="{name}" required>
+      </label>
+      <label class="field">Commande (sans le préfixe ExecStart=)
+        <textarea name="command" required>{command}</textarea>
+      </label>
+      <button class="primary" type="submit">Enregistrer</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+ROW_TEMPLATE = """<div class="model-row{active_class}">
+  <label class="row-select">
+    <input type="radio" name="idx" value="{idx}" {checked}>
+    <div class="model-main">
+      <div class="model-name">{name} {badge}</div>
+      <div class="model-cmd">{command}</div>
+    </div>
+  </label>
+  <div class="row-actions">
+    <a href="/edit?idx={idx}">Modifier</a>
+    <button class="danger" type="submit" formaction="/delete" name="delete_idx" value="{idx}"
+            onclick="return confirm('Supprimer cette configuration ?');">Supprimer</button>
+  </div>
+</div>
+"""
+
+
+def render_status_fragment():
+    status = get_service_status()
+    state = status["active_state"]
+    if state == "active":
+        pill_class, pill_label = "pill-active", "ACTIF"
+    elif state == "failed":
+        pill_class, pill_label = "pill-failed", "EN ÉCHEC"
+    else:
+        pill_class, pill_label = "pill-inactive", state.upper()
+
+    rows = [
+        ("État du service", f'<span class="pill {pill_class}">{html.escape(pill_label)}</span>'),
+        ("Démarrage au boot", html.escape(status["enabled_state"])),
+        ("Actif depuis", html.escape(status["active_since_human"] or "—")),
+        ("Serveur à l'écoute depuis",
+         html.escape(status["listening_since_human"] or "en attente / non détecté")),
+    ]
+    if status["listening_url"]:
+        rows.append(("Adresse détectée", html.escape(status["listening_url"])))
+
+    dts = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+    return f'<h2>Statut du service</h2><dl class="status-grid">{dts}</dl>'
+
+
+def render_page(message_html=""):
+    try:
+        configs = read_configs()
+    except Exception as e:
+        message_html = f'<div class="card"><p class="msg-err">Erreur de lecture du fichier : {html.escape(str(e))}</p></div>'
+        configs = []
+
+    if not configs:
+        rows_html = '<p class="msg-err">Aucune configuration enregistrée. Ajoutez-en une ci-dessous.</p>'
+    else:
+        rows = []
+        for idx, c in enumerate(configs):
+            rows.append(ROW_TEMPLATE.format(
+                active_class=" active" if c["active"] else "",
+                idx=idx,
+                checked="checked" if c["active"] else "",
+                name=html.escape(c["name"]),
+                badge='<span class="badge">ACTIF</span>' if c["active"] else "",
+                command=html.escape(c["command"]),
+            ))
+        rows_html = "\n".join(rows)
+
+    return PAGE_TEMPLATE.format(
+        style=STYLE,
+        service_file=html.escape(SERVICE_FILE),
+        message_block=message_html,
+        status_fragment=render_status_fragment(),
+        rows=rows_html,
+    )
+
+
+def render_edit_page(idx, cfg):
+    return EDIT_PAGE_TEMPLATE.format(
+        style=STYLE,
+        idx=idx,
+        name=html.escape(cfg["name"]),
+        command=html.escape(cfg["command"]),
+    )
+
+
+def msg_block(ok, text):
+    cls = "msg-ok" if ok else "msg-err"
+    return f'<div class="card"><pre class="{cls}">{html.escape(text)}</pre></div>'
+
+
+# --------------------------------------------------------------------------
+# Serveur HTTP
+# --------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send_html(self, body, status=200):
+        encoded = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _read_form(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8")
+        return parse_qs(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            self._send_html(render_page())
+        elif parsed.path == "/status":
+            self._send_html(render_status_fragment())
+        elif parsed.path == "/edit":
+            qs = parse_qs(parsed.query)
+            idx_raw = qs.get("idx", [None])[0]
+            try:
+                idx = int(idx_raw)
+                configs = read_configs()
+                cfg = configs[idx] if 0 <= idx < len(configs) else None
+            except (TypeError, ValueError):
+                cfg = None
+            if cfg is None:
+                self._send_html(render_page(msg_block(False, "Configuration introuvable.")))
+            else:
+                self._send_html(render_edit_page(idx, cfg))
+        else:
+            self._send_html("<h1>404</h1>", status=404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        params = self._read_form()
+
+        def first(key, default=""):
+            return params.get(key, [default])[0]
+
+        def first_idx():
+            raw = first("idx")
+            return int(raw) if raw.isdigit() else -1
+
+        try:
+            if parsed.path == "/activate":
+                ok, text = action_activate(first_idx())
+                self._send_html(render_page(msg_block(ok, text)))
+
+            elif parsed.path == "/add":
+                ok, text = action_add(first("name"), first("command"))
+                self._send_html(render_page(msg_block(ok, text)))
+
+            elif parsed.path == "/edit":
+                ok, text = action_edit(first_idx(), first("name"), first("command"))
+                self._send_html(render_page(msg_block(ok, text)))
+
+            elif parsed.path == "/delete":
+                raw = first("delete_idx")
+                idx = int(raw) if raw.isdigit() else -1
+                ok, text = action_delete(idx)
+                self._send_html(render_page(msg_block(ok, text)))
+
+            else:
+                self._send_html("<h1>404</h1>", status=404)
+        except Exception as e:
+            self._send_html(render_page(msg_block(False, f"Erreur inattendue : {e}")))
+
+
+def main():
+    warn_if_root()
+    try:
+        normalize_if_needed()
+    except Exception as e:
+        print(f"Avertissement : normalisation initiale échouée : {e}", file=sys.stderr)
+
+    server = HTTPServer((HOST, PORT), Handler)
+    print(f"Serveur lancé sur http://{HOST}:{PORT} (Ctrl+C pour arrêter)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nArrêt du serveur.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
