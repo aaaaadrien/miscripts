@@ -19,6 +19,7 @@ echo "Creation d'un utilisateur dedie a GameShell"
 if [[ $(grep -c 'gameshell:x:942' /etc/passwd) != 1 ]]
 then
 	useradd -m -r -s /home/gameshell/gameshell.sh -u 942 -N gameshell
+    echo 'gameshell:gameshell' | chpasswd
 fi
 
 echo "Recuperation du jeu"
